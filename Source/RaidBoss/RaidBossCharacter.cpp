@@ -12,6 +12,14 @@
 #include "Materials/Material.h"
 #include "Engine/World.h"
 
+#include "RBAttributeSet.h"
+#include "RBAbilitySystemComponent.h"
+#include "RBGameplayAbility.h"
+#include "RBPlayerState.h"
+#include "RaidBossPlayerController.h"
+
+#include "Boss.h"
+
 ARaidBossCharacter::ARaidBossCharacter()
 {
 	// Set size for player capsule
@@ -24,7 +32,7 @@ ARaidBossCharacter::ARaidBossCharacter()
 
 	// Configure character movement
 	GetCharacterMovement()->bOrientRotationToMovement = true; // Rotate character to moving direction
-	GetCharacterMovement()->RotationRate = FRotator(0.f, 1250.f, 0.f);
+	GetCharacterMovement()->RotationRate = FRotator(0.f, 1600.f, 0.f);
 	GetCharacterMovement()->bConstrainToPlane = true;
 	GetCharacterMovement()->bSnapToPlaneAtStart = true;
 
@@ -32,8 +40,8 @@ ARaidBossCharacter::ARaidBossCharacter()
 	CameraBoom = CreateDefaultSubobject<USpringArmComponent>(TEXT("CameraBoom"));
 	CameraBoom->SetupAttachment(RootComponent);
 	CameraBoom->SetUsingAbsoluteRotation(true); // Don't want arm to rotate when character does
-	CameraBoom->TargetArmLength = 800.f;
-	CameraBoom->SetRelativeRotation(FRotator(-60.f, 0.f, 0.f));
+	CameraBoom->TargetArmLength = 900.f;
+	CameraBoom->SetRelativeRotation(FRotator(55.f, 0.f, 0.f));
 	CameraBoom->bDoCollisionTest = false; // Don't want to pull camera in when it collides with level
 
 	// Create a camera...
@@ -55,6 +63,8 @@ ARaidBossCharacter::ARaidBossCharacter()
 	// Activate ticking in order to update the cursor every frame.
 	PrimaryActorTick.bCanEverTick = true;
 	PrimaryActorTick.bStartWithTickEnabled = true;
+
+	DeadTag = FGameplayTag::RequestGameplayTag(FName("State.Dead"));
 }
 
 void ARaidBossCharacter::Tick(float DeltaSeconds)
@@ -63,22 +73,7 @@ void ARaidBossCharacter::Tick(float DeltaSeconds)
 
 	if (CursorToWorld != nullptr)
 	{
-		if (UHeadMountedDisplayFunctionLibrary::IsHeadMountedDisplayEnabled())
-		{
-			/* VR Code (I think) maybe remove later. */
-			if (UWorld* World = GetWorld())
-			{
-				FHitResult HitResult;
-				FCollisionQueryParams Params(NAME_None, FCollisionQueryParams::GetUnknownStatId());
-				FVector StartLocation = TopDownCameraComponent->GetComponentLocation();
-				FVector EndLocation = TopDownCameraComponent->GetComponentRotation().Vector() * 2000.0f;
-				Params.AddIgnoredActor(this);
-				World->LineTraceSingleByChannel(HitResult, StartLocation, EndLocation, ECC_Visibility, Params);
-				FQuat SurfaceRotation = HitResult.ImpactNormal.ToOrientationRotator().Quaternion();
-				CursorToWorld->SetWorldLocationAndRotation(HitResult.Location, SurfaceRotation);
-			}
-		}
-		else if (APlayerController* PC = Cast<APlayerController>(GetController()))
+		if (APlayerController* PC = Cast<APlayerController>(GetController()))
 		{
 			FHitResult TraceHitResult;
 			PC->GetHitResultUnderCursor(ECC_Visibility, true, TraceHitResult);
@@ -86,6 +81,200 @@ void ARaidBossCharacter::Tick(float DeltaSeconds)
 			FRotator CursorR = CursorFV.Rotation();
 			CursorToWorld->SetWorldLocation(TraceHitResult.Location);
 			CursorToWorld->SetWorldRotation(CursorR);
+
+			PC->GetHitResultUnderCursor(ECC_GameTraceChannel2, true, TraceHitResult);
+			if (TraceHitResult.bBlockingHit) {
+				ABoss* BossActor = Cast<ABoss>(TraceHitResult.GetActor());
+				if (BossActor) {
+					BossActor->SetSelected(true);
+					Selected = BossActor;
+				}
+			}
+			else {
+            if (Selected != nullptr) {
+               Selected->SetSelected(false);
+               Selected = nullptr;
+            }
+			}
 		}
 	}
+}
+
+void ARaidBossCharacter::SetupPlayerInputComponent(UInputComponent* PlayerInputComponent)
+{
+	Super::SetupPlayerInputComponent(PlayerInputComponent);
+
+	BindASCInput();
+}
+
+void ARaidBossCharacter::PossessedBy(AController* NewController)
+{
+	Super::PossessedBy(NewController);
+
+	ARBPlayerState* PS = GetPlayerState<ARBPlayerState>();
+	if (PS) {
+		// Set ASC on server, clients do this in OnRep_PlayerState
+		AbilitySystemComponent = Cast<URBAbilitySystemComponent>(PS->GetAbilitySystemComponent());
+
+		// AI won't have PCs, so can init again here to be sure. No harm initing twice for hero PCs.
+		PS->GetAbilitySystemComponent()->InitAbilityActorInfo(PS, this);
+
+		AttributeSet = PS->GetAttributeSet();
+
+		InitializeAttributes();
+		AddStartupEffects();
+		AddCharacterAbilities();
+
+		ARaidBossPlayerController* PC = Cast<ARaidBossPlayerController>(GetController());
+		if (PC) {
+		//	PC->CreateHUD();
+		}
+
+		// Respawn specific things that won't affect first possession.
+
+		// Forcibly set DeadTag count to 0
+		AbilitySystemComponent->SetTagMapCount(DeadTag, 0);
+
+		// Set Health/Mana to max, only necessary for respawn
+	}
+}
+
+UAbilitySystemComponent* ARaidBossCharacter::GetAbilitySystemComponent() const
+{
+	return AbilitySystemComponent.Get();
+}
+
+int32 ARaidBossCharacter::GetCharacterLevel() const
+{
+	if (AttributeSet.IsValid()) {
+		return static_cast<int32>(AttributeSet->GetCharacterLevel());
+	}
+
+	return 0;
+}
+
+float ARaidBossCharacter::GetHeath() const
+{
+	if (AttributeSet.IsValid()) {
+		return AttributeSet->GetHealth();
+	}
+
+	return 0.0f;
+}
+
+void ARaidBossCharacter::AddCharacterAbilities()
+{
+	if (GetLocalRole() != ROLE_Authority || !AbilitySystemComponent.IsValid() || AbilitySystemComponent->CharacterAbilitiesGiven) {
+		return;
+	}
+
+	for (TSubclassOf<URBGameplayAbility>& StartupAbility : CharacterAbilities) {
+		AbilitySystemComponent->GiveAbility(
+			FGameplayAbilitySpec(StartupAbility, 
+				GetAbilityLevel(StartupAbility.GetDefaultObject()->AbilityID),
+				static_cast<int32>(StartupAbility.GetDefaultObject()->AbilityInputID), this)
+		);
+	}
+
+	AbilitySystemComponent->CharacterAbilitiesGiven = true;
+}
+
+void ARaidBossCharacter::InitializeAttributes()
+{
+	if (!AbilitySystemComponent.IsValid()) {
+		return;
+	}
+	
+	if (!DefaultAttributes) {
+		UE_LOG(LogTemp, Error, TEXT("%s() Missing DefaultAttributes for %s."), *FString(__FUNCTION__), *GetName());
+	}
+
+	// Can run on server and client
+	FGameplayEffectContextHandle EffectContext = AbilitySystemComponent->MakeEffectContext();
+	EffectContext.AddSourceObject(this);
+
+	FGameplayEffectSpecHandle NewHandle = AbilitySystemComponent->MakeOutgoingSpec(DefaultAttributes, GetCharacterLevel(), EffectContext);
+	if (NewHandle.IsValid()) {
+		FActiveGameplayEffectHandle ActiveGEHandle = AbilitySystemComponent->ApplyGameplayEffectSpecToTarget(*NewHandle.Data.Get(), AbilitySystemComponent.Get());
+	}
+}
+
+void ARaidBossCharacter::AddStartupEffects()
+{
+	if (GetLocalRole() != ROLE_Authority || !AbilitySystemComponent.IsValid() || AbilitySystemComponent->StartupEffectsApplied) {
+		return;
+	}
+
+	FGameplayEffectContextHandle EffectContext = AbilitySystemComponent->MakeEffectContext();
+	EffectContext.AddSourceObject(this);
+
+	for (TSubclassOf<UGameplayEffect> GameplayEffect : StartupEffects) {
+		FGameplayEffectSpecHandle NewHandle = AbilitySystemComponent->MakeOutgoingSpec(GameplayEffect, GetCharacterLevel(), EffectContext);
+		if (NewHandle.IsValid()) {
+			FActiveGameplayEffectHandle ActiveGEHandle = AbilitySystemComponent->ApplyGameplayEffectSpecToTarget(*NewHandle.Data.Get(), AbilitySystemComponent.Get());
+		}
+	}
+
+	AbilitySystemComponent->StartupEffectsApplied = true;
+}
+
+void ARaidBossCharacter::OnRep_PlayerState()
+{
+	Super::OnRep_PlayerState();
+
+	ARBPlayerState* PS = GetPlayerState<ARBPlayerState>();
+	if (PS) {
+		// Set ASC for clients, server does this in PossesedBy
+		AbilitySystemComponent = Cast<URBAbilitySystemComponent>(PS->GetAbilitySystemComponent());
+
+		// Init ASC ActorInfo for clients, server inits its ASC when it possesses a new Actor
+		AbilitySystemComponent->InitAbilityActorInfo(PS, this);
+
+		BindASCInput();
+
+		AttributeSet = PS->GetAttributeSet();
+
+		// For handling players disconnectin/rejoining in the future, we will need to change this so that
+		// possession doesn't necessarily respawn attributes. For now, possession = spawn/respawn.
+		InitializeAttributes();
+
+		ARaidBossPlayerController* PC = Cast<ARaidBossPlayerController>(GetController());
+		if (PC) {
+			//PC->CreateHUD();
+		}
+
+		// Respawn specific things that won't affect first possession.
+
+		// Forcibly set DeadTag count to 0
+		AbilitySystemComponent->SetTagMapCount(DeadTag, 0);
+
+		// Set Health/Mana to max - this is only necessary for respawns
+	}
+}
+
+void ARaidBossCharacter::BindASCInput()
+{
+	if (!ASCInputBound && AbilitySystemComponent.IsValid() && IsValid(InputComponent)) {
+		AbilitySystemComponent->BindAbilityActivationToInputComponent(
+			InputComponent, 
+			FGameplayAbilityInputBinds(FString("ConfirmTarget"), FString("CancelTarget"), FString("ERBAbilityInputID"),
+				static_cast<int32>(ERBAbilityInputID::Confirm), static_cast<int32>(ERBAbilityInputID::Cancel))
+		);
+
+		ASCInputBound = true;
+	}
+}
+
+void ARaidBossCharacter::SetInProgressAbility(URBGameplayAbility* Ability)
+{
+	InProgressAbility = Ability;
+}
+
+URBGameplayAbility* ARaidBossCharacter::GetInProgressAbility()
+{
+	return InProgressAbility;
+}
+
+int32 ARaidBossCharacter::GetAbilityLevel(ERBAbilityInputID AbilityID) const {
+	return 1;
 }
